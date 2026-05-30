@@ -1,0 +1,13 @@
+rtsp: false
+writeQueueSize: 2048
+rtmp: yes
+rtmpAddress: :1935
+hls: false
+webrtc: false
+srt: false
+
+paths:
+  live/entry:
+    source: publisher
+  live/exit:
+    source: publisher

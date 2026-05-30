@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+set_camera_urls.bat
+
+# Runtime data
+attendance.db
+attendance.db-journal
+logs/
+dashboard/node_modules/
+dashboard/dist/
+mediamtx-bin/
+mediamtx_v*_windows_amd64.zip
+mediamtx*.log
+
+# Third-party clone (re-fetchable; also contains paths invalid on Windows)
+third_party/
+
+# Large model binaries — re-generate via tools/convert_antispoof.py
+models/models/anti_spoof/*.onnx
+models/models/anti_spoof/*.onnx.data
+
+# IDE
+.vscode/
+.idea/
+*.swp

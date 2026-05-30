@@ -1,0 +1,9 @@
+openvino
+opencv-python
+numpy
+scipy
+psycopg[binary]
+fastapi
+uvicorn[standard]
+python-dotenv
+python-multipart
