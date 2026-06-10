@@ -12,6 +12,8 @@ set EXIT_STREAM_URL=rtmp://127.0.0.1:1935/live/exit
   --smooth_min_votes 2 ^
   --min_blur_var 0 ^
   --min_face_size 40 ^
+  --drop_stale_frames ^
+  --process_every 2 ^
   --no_enroll_augment ^
   --direction out ^
   --camera_name exit-camera ^

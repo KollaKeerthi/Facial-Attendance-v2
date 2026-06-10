@@ -30,7 +30,19 @@ class Module:
 
     def deploy(self, device, max_requests=1):
         self.max_requests = max_requests
-        compiled_model = self.core.compile_model(self.model, device)
+        try:
+            compiled_model = self.core.compile_model(self.model, device)
+        except RuntimeError as exc:
+            if device == 'CPU':
+                raise
+            log.warning(
+                'Could not load %s model to %s (%s). Falling back to CPU.',
+                self.model_type,
+                device,
+                exc,
+            )
+            compiled_model = self.core.compile_model(self.model, 'CPU')
+            device = 'CPU'
         self.output_tensor = compiled_model.outputs[0]
         self.infer_queue = AsyncInferQueue(compiled_model, self.max_requests)
         self.infer_queue.set_callback(self.completion_callback)

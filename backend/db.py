@@ -15,6 +15,10 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / '.env')
 DEFAULT_DATABASE_URL = 'postgresql://postgres:postgres@localhost:5432/attendance'
 
+DEFAULT_ADMIN_EMAIL = os.getenv('ADMIN_EMAIL', 'admin@example.com')
+DEFAULT_ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'admin123')
+DEFAULT_COMPANY_NAME = os.getenv('DEFAULT_COMPANY_NAME', 'Default Company')
+
 
 def database_url():
     return os.getenv('DATABASE_URL', DEFAULT_DATABASE_URL)
@@ -49,6 +53,53 @@ def init_db():
             for stmt in SCHEMA_POSTGRES:
                 cur.execute(stmt)
         conn.commit()
+        seed_defaults(conn)
+
+
+def seed_defaults(conn):
+    """Create default company, migrate orphan records, and create first admin.
+
+    Safe to call on every startup — all operations are idempotent.
+    Returns the default company id.
+    """
+    from backend.auth import hash_password  # deferred to avoid import cycle at module load
+
+    # Create default company if none exists
+    company = conn.execute('SELECT id FROM companies LIMIT 1').fetchone()
+    if not company:
+        company = conn.execute(
+            """INSERT INTO companies (name, slug)
+               VALUES (%s, %s)
+               ON CONFLICT (slug) DO UPDATE SET name = EXCLUDED.name
+               RETURNING id""",
+            (DEFAULT_COMPANY_NAME, 'default'),
+        ).fetchone()
+    company_id = company['id']
+
+    # Assign orphan records (NULL company_id) to the default company
+    for table in ('employees', 'cameras', 'attendance_sessions', 'attendance_events', 'spoof_attempts'):
+        conn.execute(
+            f'UPDATE {table} SET company_id = %s WHERE company_id IS NULL',
+            (company_id,),
+        )
+
+    # Backfill approval_status for old events that pre-date the column
+    conn.execute(
+        "UPDATE attendance_events SET approval_status = 'approved' WHERE approval_status IS NULL"
+    )
+
+    # Create platform_admin if no attendance_users exist at all
+    existing = conn.execute('SELECT id FROM attendance_users LIMIT 1').fetchone()
+    if not existing:
+        conn.execute(
+            """INSERT INTO attendance_users (company_id, email, password_hash, role)
+               VALUES (%s, %s, %s, 'platform_admin')
+               ON CONFLICT (email) DO NOTHING""",
+            (company_id, DEFAULT_ADMIN_EMAIL, hash_password(DEFAULT_ADMIN_PASSWORD)),
+        )
+
+    conn.commit()
+    return company_id
 
 
 def snapshot_url(path):

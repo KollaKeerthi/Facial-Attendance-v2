@@ -11,3 +11,11 @@ paths:
     source: publisher
   live/exit:
     source: publisher
+  live/entry-1:
+    source: publisher
+  live/entry-2:
+    source: publisher
+  live/exit-1:
+    source: publisher
+  live/exit-2:
+    source: publisher

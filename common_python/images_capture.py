@@ -117,12 +117,34 @@ class VideoCapWrapper(ImagesCapture):
         self.reader_metrics = PerformanceMetrics()
         self.cap = cv2.VideoCapture()
         status = self.cap.open(input)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if not status:
             raise InvalidInput("Can't open the video from {}".format(input))
 
     def read(self):
         start_time = perf_counter()
         status, image = self.cap.read()
+        if not status:
+            if not self.loop:
+                return None
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            status, image = self.cap.read()
+            if not status:
+                return None
+        self.reader_metrics.update(start_time)
+        return image
+
+    def read_latest(self, max_grabs=4):
+        start_time = perf_counter()
+        grabbed = 0
+        for _ in range(max(0, max_grabs)):
+            if not self.cap.grab():
+                break
+            grabbed += 1
+        if grabbed:
+            status, image = self.cap.retrieve()
+        else:
+            status, image = self.cap.read()
         if not status:
             if not self.loop:
                 return None

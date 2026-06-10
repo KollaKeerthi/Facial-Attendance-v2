@@ -7,3 +7,8 @@ fastapi
 uvicorn[standard]
 python-dotenv
 python-multipart
+PyJWT>=2.8.0
+bcrypt>=4.0.0
+# Optional acceleration for indexed gallery matching. If unavailable on Windows,
+# the app automatically falls back to a vectorized NumPy index.
+# faiss-cpu

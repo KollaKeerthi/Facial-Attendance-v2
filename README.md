@@ -136,6 +136,41 @@ Start the recognition workers in two more terminals:
 .\run_exit_worker.bat
 ```
 
+For a four-camera CCTV or OBS pilot, edit `config\cameras.json`, start
+MediaMTX, and run:
+
+```powershell
+.\run_camera_workers.bat
+```
+
+To pre-compute the face gallery descriptors and make worker startup faster:
+
+```powershell
+.\run_enroll.bat
+```
+
+To start the local backend, dashboard, MediaMTX, and four configured workers in
+one command:
+
+```powershell
+.\run_all.bat
+```
+
+OBS test laptops can publish to:
+
+```text
+rtmp://MAIN_LAPTOP_IP:1935/live/entry-1
+rtmp://MAIN_LAPTOP_IP:1935/live/entry-2
+rtmp://MAIN_LAPTOP_IP:1935/live/exit-1
+rtmp://MAIN_LAPTOP_IP:1935/live/exit-2
+```
+
+For CCTV/NVR deployments, prefer each camera's low-latency substream RTSP URL
+at 720p and 8-10 FPS, and place those URLs in `config\cameras.json`.
+
+This version uses PostgreSQL/Neon, not SQLite, so SQLite WAL mode is not needed.
+Concurrent worker writes go through FastAPI/PostgreSQL.
+
 ## Employee Enrollment
 
 1. Open the dashboard.

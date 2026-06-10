@@ -24,6 +24,7 @@ from pathlib import Path
 from logging.handlers import RotatingFileHandler
 from time import sleep
 from time import perf_counter
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -55,7 +56,7 @@ log.basicConfig(format='%(asctime)s [ %(levelname)s ] %(message)s',
                 stream=sys.stdout)
 load_dotenv(Path(__file__).resolve().parents[1] / '.env')
 
-DEVICE_KINDS = ['CPU', 'GPU', 'HETERO']
+DEVICE_KINDS = ['CPU', 'GPU', 'NPU', 'AUTO', 'AUTO:GPU,CPU', 'AUTO:NPU,GPU,CPU', 'HETERO']
 SPOOF_ID = -2
 DEFAULT_DATABASE_URL = 'postgresql://postgres:postgres@localhost:5432/attendance'
 
@@ -73,6 +74,15 @@ def build_argparser():
                          help='Optional. Reopen the input if a livestream drops.')
     general.add_argument('--reconnect_delay', default=2.0, type=float,
                          help='Optional. Seconds to wait before reconnecting.')
+    general.add_argument('--drop_stale_frames', action='store_true',
+                         help='Optional. For livestreams, skip buffered frames before '
+                              'recognition so processing stays near the live edge.')
+    general.add_argument('--stale_frame_grabs', default=4, type=int,
+                         help='Optional. Number of buffered frames to try to skip when '
+                              '--drop_stale_frames is enabled.')
+    general.add_argument('--process_every', default=1, type=int,
+                         help='Optional. Run recognition once every N captured frames. '
+                              'Use 2-3 for faster live attendance on weak CPUs.')
     general.add_argument('-o', '--output',
                          help='Optional. Name of the output file(s) to save. Frames of odd width or height can be truncated. See https://github.com/opencv/opencv/pull/24086')
     general.add_argument('-limit', '--output_limit', default=1000, type=int,
@@ -118,15 +128,15 @@ def build_argparser():
                              'reshaping. Example: 500 700.')
 
     infer = parser.add_argument_group('Inference options')
-    infer.add_argument('-d_fd', default='CPU', choices=DEVICE_KINDS,
+    infer.add_argument('-d_fd', default='AUTO:GPU,CPU', choices=DEVICE_KINDS,
                        help='Optional. Target device for Face Detection model. '
-                            'Default value is CPU.')
-    infer.add_argument('-d_lm', default='CPU', choices=DEVICE_KINDS,
+                            'Default value is AUTO:GPU,CPU.')
+    infer.add_argument('-d_lm', default='AUTO:GPU,CPU', choices=DEVICE_KINDS,
                        help='Optional. Target device for Facial Landmarks Detection '
-                            'model. Default value is CPU.')
-    infer.add_argument('-d_reid', default='CPU', choices=DEVICE_KINDS,
+                            'model. Default value is AUTO:GPU,CPU.')
+    infer.add_argument('-d_reid', default='AUTO:GPU,CPU', choices=DEVICE_KINDS,
                        help='Optional. Target device for Face Reidentification '
-                            'model. Default value is CPU.')
+                            'model. Default value is AUTO:GPU,CPU.')
     infer.add_argument('-v', '--verbose', action='store_true',
                        help='Optional. Be more verbose.')
     infer.add_argument('-t_fd', metavar='[0..1]', type=float, default=0.6,
@@ -152,7 +162,7 @@ def build_argparser():
     infer.add_argument('--min_blur_var', type=float, default=40.0,
                        help='Optional. Laplacian variance threshold for blur. '
                             'Frames below this are excluded from voting. 0 disables.')
-    infer.add_argument('-d_as', default='CPU', choices=DEVICE_KINDS,
+    infer.add_argument('-d_as', default='AUTO:GPU,CPU', choices=DEVICE_KINDS,
                        help='Optional. Target device for the Anti-Spoofing model.')
     infer.add_argument('--as_scale', type=float, default=2.7,
                        help='Optional. Bbox expansion ratio for the anti-spoof crop. '
@@ -175,6 +185,10 @@ def build_argparser():
                           'entry stream and "out" for exit stream.')
     att.add_argument('--camera_name', default='',
                      help='Optional. Stable camera name shown in the dashboard.')
+    att.add_argument('--company_id', type=int, default=int(os.getenv('COMPANY_ID', '1')),
+                     help='Optional. Company id used for multi-company attendance data.')
+    att.add_argument('--worker_secret', default=os.getenv('WORKER_SECRET', ''),
+                     help='Optional. Secret sent to protected worker API endpoints.')
     att.add_argument('--verification_confidence', type=float, default=0.65,
                      help='Optional. Events below this confidence are flagged '
                           'for HR verification in the dashboard.')
@@ -314,7 +328,9 @@ class FrameProcessor:
         self.min_face_size = args.min_face_size
         self.min_blur_var = args.min_blur_var
         self.direction = args.direction
+        self.verbose = args.verbose
         self.frame_index = 0
+        self.last_inference_ms = None
         self.attendance_cooldown = args.attendance_cooldown
         self.last_attendance_post = {}
 
@@ -327,6 +343,8 @@ class FrameProcessor:
                 stream_url=args.input,
                 verification_confidence=args.verification_confidence,
                 send_snapshots=not args.no_event_snapshots,
+                company_id=args.company_id,
+                worker_secret=args.worker_secret or None,
             )
             log.info('Attendance logging enabled via API: %s (%s)', args.api_url, args.direction)
         elif args.db_url:
@@ -337,6 +355,7 @@ class FrameProcessor:
                 camera_name=args.camera_name or None,
                 stream_url=args.input,
                 verification_confidence=args.verification_confidence,
+                company_id=args.company_id,
             )
             log.info('Attendance logging enabled: %s (%s)', args.db_url, args.direction)
         # Most-recent "✓ marked" banner shown on screen.
@@ -394,6 +413,7 @@ class FrameProcessor:
         return True
 
     def process(self, frame):
+        process_start = perf_counter()
         self.frame_index += 1
         orig_image = frame.copy()
 
@@ -413,11 +433,12 @@ class FrameProcessor:
 
         landmarks = self.landmarks_detector.infer((frame, rois))
         face_identities, unknowns = self.face_identifier.infer((frame, rois, landmarks))
-        for i, ident in enumerate(face_identities):
-            label = self.face_identifier.get_identity_label(ident.id)
-            confidence = 1.0 - float(ident.distance)
-            log.info('STEP recognize direction=%s frame=%s face=%s label=%s confidence=%.3f',
-                     self.direction, self.frame_index, i, label, confidence)
+        if self.verbose:
+            for i, ident in enumerate(face_identities):
+                label = self.face_identifier.get_identity_label(ident.id)
+                confidence = 1.0 - float(ident.distance)
+                log.info('STEP recognize direction=%s frame=%s face=%s label=%s confidence=%.3f',
+                         self.direction, self.frame_index, i, label, confidence)
 
         for i, is_spoof in enumerate(spoof_mask):
             if is_spoof:
@@ -472,6 +493,7 @@ class FrameProcessor:
                     if marked:
                         self.flash = (name, time_str, time.monotonic() + 2.5)
 
+        self.last_inference_ms = (perf_counter() - process_start) * 1000.0
         return [rois, landmarks, face_identities]
 
 
@@ -545,6 +567,11 @@ def main():
     frame_processor = FrameProcessor(args)
 
     frame_num = 0
+    processed_frames = 0
+    stats_started_at = perf_counter()
+    last_heartbeat_at = 0.0
+    reconnect_count = 0
+    last_frame_at = None
     metrics = PerformanceMetrics()
     presenter = None
     output_transform = None
@@ -557,9 +584,13 @@ def main():
 
     while True:
         start_time = perf_counter()
-        frame = cap.read()
+        if args.drop_stale_frames and hasattr(cap, 'read_latest'):
+            frame = cap.read_latest(args.stale_frame_grabs)
+        else:
+            frame = cap.read()
         if frame is None:
             if args.reconnect:
+                reconnect_count += 1
                 log.warning('Input stream ended. Reconnecting in %.1f seconds...', args.reconnect_delay)
                 sleep(args.reconnect_delay)
                 cap = open_images_capture(args.input, args.loop)
@@ -581,7 +612,13 @@ def main():
                                                      cap.fps(), output_resolution):
                 raise RuntimeError("Can't open video writer")
 
+        if args.process_every > 1 and frame_num % args.process_every != 0:
+            frame_num += 1
+            continue
+
         detections = frame_processor.process(frame)
+        processed_frames += 1
+        last_frame_at = datetime.now().astimezone().isoformat()
         presenter.drawGraphs(frame)
         frame = draw_detections(frame, frame_processor, detections, output_transform)
         draw_flash(frame, frame_processor)
@@ -599,9 +636,39 @@ def main():
                 break
             presenter.handleKey(key)
 
+        now = perf_counter()
+        if now - last_heartbeat_at >= 10.0:
+            elapsed = max(now - stats_started_at, 0.001)
+            fps = processed_frames / elapsed
+            api_queue_size = (
+                frame_processor.attendance.queue_size()
+                if hasattr(frame_processor.attendance, 'queue_size')
+                else None
+            )
+            log.info(
+                'HEALTH camera=%s direction=%s fps=%.2f inference_ms=%s api_queue=%s reconnects=%s last_frame=%s',
+                args.camera_name or f'{args.direction}-camera',
+                args.direction,
+                fps,
+                f'{frame_processor.last_inference_ms:.1f}' if frame_processor.last_inference_ms is not None else None,
+                api_queue_size,
+                reconnect_count,
+                last_frame_at,
+            )
+            if hasattr(frame_processor.attendance, 'heartbeat'):
+                frame_processor.attendance.heartbeat(
+                    fps=fps,
+                    inference_ms=frame_processor.last_inference_ms,
+                    reconnect_count=reconnect_count,
+                    last_frame_at=last_frame_at,
+                )
+            last_heartbeat_at = now
+
     metrics.log_total()
     for rep in presenter.reportMeans():
         log.info(rep)
+    if frame_processor.attendance is not None:
+        frame_processor.attendance.close()
 
 
 if __name__ == '__main__':

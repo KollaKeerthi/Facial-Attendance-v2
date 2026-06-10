@@ -25,6 +25,11 @@ from scipy.spatial.distance import cosine
 
 from face_detector import FaceDetector
 
+try:
+    import faiss
+except ImportError:
+    faiss = None
+
 
 class FacesDatabase:
     IMAGE_EXTENSIONS = ['jpg', 'png']
@@ -49,10 +54,15 @@ class FacesDatabase:
         path = osp.abspath(path)
         self.fg_path = path
         self.no_show = no_show
+        self.augment = augment
+        self._flat_descriptors = None
+        self._flat_identity_ids = None
+        self._faiss_index = None
+        self._building = True
         paths = []
         if osp.isdir(path):
-            paths = [osp.join(path, f) for f in os.listdir(path)
-                      if f.split('.')[-1] in self.IMAGE_EXTENSIONS]
+            paths = sorted(osp.join(path, f) for f in os.listdir(path)
+                           if f.split('.')[-1].lower() in self.IMAGE_EXTENSIONS)
         else:
             log.error("Wrong face images database path. Expected a "
                       "path to the directory containing %s files, "
@@ -63,6 +73,12 @@ class FacesDatabase:
             log.error("The images database folder has no images.")
 
         self.database = []
+        if self._load_cache(paths, face_detector is not None):
+            self._building = False
+            self._rebuild_match_index()
+            log.info("Loaded faces database cache, registered {} identities".format(len(self.database)))
+            return
+
         for path in paths:
             label = osp.splitext(osp.basename(path))[0]
             image = cv2.imread(path, flags=cv2.IMREAD_COLOR)
@@ -102,6 +118,129 @@ class FacesDatabase:
                     roi_label = label if len(rois) == 1 else "{}-{}".format(label, idx)
                     log.debug("Adding label {} (variant {}) to the gallery".format(roi_label, variant_idx))
                     self.add_item(descriptor, roi_label)
+
+        self._save_cache(paths, face_detector is not None)
+        self._building = False
+        self._rebuild_match_index()
+
+    def _cache_path(self):
+        return osp.join(self.fg_path, '.face_descriptors_cache.npz')
+
+    @staticmethod
+    def _paths_signature(paths):
+        return np.array([
+            '{}|{}|{}'.format(osp.basename(p), int(osp.getmtime(p)), osp.getsize(p))
+            for p in paths
+        ])
+
+    def _load_cache(self, paths, run_detector):
+        cache_path = self._cache_path()
+        if not osp.exists(cache_path):
+            return False
+        try:
+            data = np.load(cache_path, allow_pickle=True)
+            if bool(data['augment']) != bool(self.augment):
+                return False
+            if bool(data['run_detector']) != bool(run_detector):
+                return False
+            if not np.array_equal(data['paths_signature'], self._paths_signature(paths)):
+                return False
+            labels = data['labels'].tolist()
+            descriptors = data['descriptors']
+            identity_ids = data['identity_ids']
+        except Exception as exc:
+            log.warning("Could not load faces cache %s: %s", cache_path, exc)
+            return False
+
+        self.database = []
+        for label in labels:
+            idxs = np.where(identity_ids == len(self.database))[0]
+            self.database.append(FacesDatabase.Identity(label, [descriptors[i] for i in idxs]))
+        return True
+
+    def _save_cache(self, paths, run_detector):
+        if not osp.isdir(self.fg_path):
+            return
+        descriptors = []
+        identity_ids = []
+        labels = []
+        for identity_id, identity in enumerate(self.database):
+            labels.append(identity.label)
+            for desc in identity.descriptors:
+                descriptors.append(np.asarray(desc, dtype=np.float32))
+                identity_ids.append(identity_id)
+        if not descriptors:
+            return
+        cache_path = self._cache_path()
+        try:
+            np.savez_compressed(
+                cache_path,
+                labels=np.array(labels),
+                descriptors=np.vstack(descriptors).astype(np.float32),
+                identity_ids=np.array(identity_ids, dtype=np.int32),
+                paths_signature=self._paths_signature(paths),
+                augment=np.array(bool(self.augment)),
+                run_detector=np.array(bool(run_detector)),
+            )
+            log.info("Saved faces database cache to %s", cache_path)
+        except Exception as exc:
+            log.warning("Could not save faces cache %s: %s", cache_path, exc)
+
+    def _rebuild_match_index(self):
+        descriptors = []
+        identity_ids = []
+        for identity_id, identity in enumerate(self.database):
+            for desc in identity.descriptors:
+                descriptors.append(np.asarray(desc, dtype=np.float32))
+                identity_ids.append(identity_id)
+        if not descriptors:
+            self._flat_descriptors = None
+            self._flat_identity_ids = None
+            self._faiss_index = None
+            return
+
+        flat = np.vstack(descriptors).astype(np.float32)
+        norms = np.linalg.norm(flat, axis=1, keepdims=True)
+        flat = flat / np.maximum(norms, 1e-12)
+        self._flat_descriptors = flat
+        self._flat_identity_ids = np.array(identity_ids, dtype=np.int32)
+        self._faiss_index = None
+        if faiss is not None:
+            self._faiss_index = faiss.IndexFlatIP(flat.shape[1])
+            self._faiss_index.add(flat)
+
+    def _identity_distances(self, descriptors):
+        if len(self.database) == 0:
+            return np.empty((len(descriptors), 0), dtype=np.float32)
+        if self._flat_descriptors is None:
+            self._rebuild_match_index()
+        if self._flat_descriptors is None:
+            return np.empty((len(descriptors), 0), dtype=np.float32)
+
+        queries = np.asarray(descriptors, dtype=np.float32)
+        queries = queries / np.maximum(np.linalg.norm(queries, axis=1, keepdims=True), 1e-12)
+
+        if self._faiss_index is not None:
+            sims, idxs = self._faiss_index.search(queries, self._flat_descriptors.shape[0])
+            distances = np.full((len(queries), len(self.database)), 1.0, dtype=np.float32)
+            for row_id in range(len(queries)):
+                for sim, flat_idx in zip(sims[row_id], idxs[row_id]):
+                    if flat_idx < 0:
+                        continue
+                    identity_id = self._flat_identity_ids[flat_idx]
+                    distance = (1.0 - float(sim)) * 0.5
+                    if distance < distances[row_id, identity_id]:
+                        distances[row_id, identity_id] = distance
+            return distances
+
+        sims = np.matmul(queries, self._flat_descriptors.T)
+        distances = np.full((len(queries), len(self.database)), 1.0, dtype=np.float32)
+        for flat_idx, identity_id in enumerate(self._flat_identity_ids):
+            distances[:, identity_id] = np.minimum(
+                distances[:, identity_id],
+                (1.0 - sims[:, flat_idx]) * 0.5,
+            )
+        return distances
 
     def ask_to_save(self, image):
         if self.no_show:
@@ -157,14 +296,9 @@ class FacesDatabase:
         return name if save else None
 
     def match_faces(self, descriptors, match_algo='HUNGARIAN'):
-        database = self.database
-        distances = np.empty((len(descriptors), len(database)))
-        for i, desc in enumerate(descriptors):
-            for j, identity in enumerate(database):
-                dist = []
-                for id_desc in identity.descriptors:
-                    dist.append(FacesDatabase.Identity.cosine_dist(desc, id_desc))
-                distances[i][j] = dist[np.argmin(dist)]
+        distances = self._identity_distances(descriptors)
+        if distances.shape[1] == 0:
+            return [(0, 1.0) for _ in descriptors]
 
         matches = []
         # if user specify MIN_DIST for face matching, face with minium cosine distance will be selected.
@@ -246,6 +380,8 @@ class FacesDatabase:
             self.database[match].descriptors.append(desc)
             log.debug("Appending new descriptor for label {}.".format(label))
 
+        if not self._building:
+            self._rebuild_match_index()
         return match, label
 
     def __getitem__(self, idx):
